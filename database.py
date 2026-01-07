@@ -472,112 +472,179 @@ class RankingDatabase:
         
         return has_changed, latest_snapshot, inferences
 
+        return inferences, has_changed
+
     def _match_students_in_major(self, old_students: list[MajorStudentRanking], new_students: list[MajorStudentRanking], semester: str, infer_pnp: bool) -> tuple[list[GradeInference], bool]:
         """
-        在单个专业内部执行双轮匹配算法
-        返回: (inferences, has_changed)
+        在单个专业内部执行全局优先匹配算法 (Global Priority Matching)
+        解决顺序依赖问题：优先选择"质量最高"的匹配，而不是"先来后到"
         """
         inferences = []
         has_changed = False
         
-        # 建立旧记录索引映射
         old_map = {i: s for i, s in enumerate(old_students)}
         used_old_indices = set()
-        unmatched_new_indices = []
+        used_new_indices = set()
         
-        # === 第一轮：精确匹配 ===
+        # === 第一轮：精确匹配 (无争议) ===
+        # 精确匹配仍然是最优先的，直接处理掉
         for new_idx, new_s in enumerate(new_students):
-            matched = False
             for old_idx, old_s in old_map.items():
-                if old_idx in used_old_indices:
-                    continue
+                if old_idx in used_old_indices: continue
                 
                 if abs(old_s.credits - new_s.credits) < 0.001 and abs(old_s.gpa - new_s.gpa) < 0.001:
                     used_old_indices.add(old_idx)
-                    matched = True
+                    used_new_indices.add(new_idx)
                     break
-            
-            if not matched:
-                unmatched_new_indices.append(new_idx)
         
-        # === 第二轮：推断匹配 ===
-        for new_idx in unmatched_new_indices:
-            new_s = new_students[new_idx]
-            
-            best_match_idx = -1
-            best_credit_diff = float('inf')
-            best_is_integer = False
-            best_is_small_update = False # 记录是否为小额更新 (< 5.0 学分)
+        # === 第二轮：全局评分匹配 ===
+        # 1. 生成所有可能的匹配边 (Edge) 及其评分 (Score)
+        # 2. 按评分排序
+        # 3. 贪心消耗
+        
+        candidates = [] # list of (score, new_idx, old_idx, credit_diff)
+        
+        matches_found_flag = False
+        
+        for new_idx, new_s in enumerate(new_students):
+            if new_idx in used_new_indices: continue
             
             for old_idx, old_s in old_map.items():
-                if old_idx in used_old_indices:
-                    continue
+                if old_idx in used_old_indices: continue
                 
                 credit_diff = new_s.credits - old_s.credits
                 
-                # 放宽上限到 15 以兼容极端情况，但在优先级中惩罚 >= 5.0
+                # 初步筛选
                 if 0.5 <= credit_diff <= 15:
                     old_weighted = old_s.gpa * old_s.credits
                     new_weighted = new_s.gpa * new_s.credits
                     inferred_gpa = (new_weighted - old_weighted) / credit_diff
                     
-                    is_reasonable = False
-                    if 1.25 <= inferred_gpa <= 4.05:
-                        is_reasonable = True
-                    elif -0.1 <= inferred_gpa <= 0.1:
-                         if infer_pnp: is_reasonable = True
-                         elif abs(inferred_gpa) <= 0.05: is_reasonable = True
-
-                    if is_reasonable:
-                        # === 优先级策略 V2 ===
-                        # 1. 学分变动量 < 5.0 (Priority High) vs >= 5.0 (Priority Low)
-                        #    用户反馈: "除非只能如此匹配，否则...匹配 >= 5分...重新尝试"
-                        # 2. 整数变动 (Priority High) vs 小数变动 (Priority Low)
-                        # 3. 变动量越小越好
-                        
-                        is_integer = abs(credit_diff - round(credit_diff)) < 0.001
-                        is_small_update = credit_diff < 5.0
-                        
-                        replace_best = False
-                        
-                        if best_match_idx == -1:
-                            replace_best = True
-                        else:
-                            # 比较当前侯选 (Current) vs 最佳侯选 (Best)
-                            
-                            # 规则 1: 优先选 < 5.0 的更新
-                            if is_small_update and not best_is_small_update:
-                                replace_best = True
-                            elif not is_small_update and best_is_small_update:
-                                replace_best = False
-                            else:
-                                # 规则 1 平局，看规则 2: 优先选整数
-                                if is_integer and not best_is_integer:
-                                    replace_best = True
-                                elif not is_integer and best_is_integer:
-                                    replace_best = False
-                                else:
-                                    # 规则 2 平局，看规则 3: 选更小的变动
-                                    if credit_diff < best_credit_diff:
-                                        replace_best = True
-                        
-                        if replace_best:
-                            best_credit_diff = credit_diff
-                            best_match_idx = old_idx
-                            best_is_integer = is_integer
-                            best_is_small_update = is_small_update
+                    # 校验合法性 (Interval Check)
+                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    if not is_valid: continue
+                    
+                    # === 评分系统 ===
+                    # 分数越高越优先
+                    score = 0
+                    
+                    # 1. 学分变动幅度 (权重最大)
+                    # < 5.0 (High Priority) vs >= 5.0 (Low)
+                    if credit_diff < 5.0: score += 1000
+                    else: score += 0 # Fallback
+                    
+                    # 2. 整数偏好
+                    # 优先整数
+                    is_integer = abs(credit_diff - round(credit_diff)) < 0.001
+                    if is_integer: score += 500
+                    
+                    # 3. 学分差越小越好 (Tie-breaker)
+                    # 减去 credit_diff，让小分值排前面
+                    score -= credit_diff
+                    
+                    candidates.append({
+                        'score': score,
+                        'new_idx': new_idx,
+                        'old_idx': old_idx,
+                        'diff': credit_diff
+                    })
+        
+        # 按分数降序排序 (Score High -> Low)
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 贪心消耗
+        for cand in candidates:
+            n_idx = cand['new_idx']
+            o_idx = cand['old_idx']
             
-            if best_match_idx != -1:
-                has_changed = True
-                used_old_indices.add(best_match_idx)
-                old_s = old_map[best_match_idx]
-                inference = GradeInference.from_change(old_s, new_s, semester, infer_pnp=infer_pnp)
-                if inference:
-                    inferences.append(inference)
-            else:
-                has_changed = True
+            if n_idx in used_new_indices or o_idx in used_old_indices:
+                continue
                 
+            # 确认匹配
+            used_new_indices.add(n_idx)
+            used_old_indices.add(o_idx)
+            has_changed = True
+            matches_found_flag = True
+            
+            old_s = old_map[o_idx]
+            new_s = new_students[n_idx]
+            inference = GradeInference.from_change(old_s, new_s, semester, infer_pnp=infer_pnp)
+            if inference:
+                inferences.append(inference)
+                
+        # 检查是否有未匹配的新增条目 (视为变化)
+        if matches_found_flag or len(used_new_indices) < len(new_students):
+             has_changed = True
+             
         return inferences, has_changed
+
+    def _is_mathematically_possible(self, old_s, new_s, credit_diff, infer_pnp):
+        """
+        判断推断出的绩点是否在数学上可能落入合法的复旦绩点区间
+        考虑到源数据的 GPA 是四舍五入到 2 位小数的
+        """
+        # 复旦合法绩点区间 (User Provided)
+        # 补充了一些缓冲以防边界定义过死
+        valid_intervals = [
+            (3.95, 4.05), # A: 4.0
+            (3.65, 3.85), # A-: 3.7-3.8
+            (3.25, 3.65), # B+: 3.3-3.6
+            (2.95, 3.25), # B: 3.0-3.2
+            (2.65, 2.95), # B-: 2.7-2.9
+            (2.25, 2.65), # C+: 2.3-2.6
+            (1.95, 2.25), # C: 2.0-2.2
+            (1.65, 1.95), # C-: 1.7-1.9
+            (1.25, 1.35), # D: 1.3
+            (0.95, 1.05), # D-: 1.0
+            (-0.05, 0.05) # F: 0
+        ]
+        
+        # 对于大额学分变动 (Composite)，放宽检查，只要在大范围内即可
+        if credit_diff >= 4.5:
+             # 只要在 -0.1 ~ 4.05 之间就算可能 (复合课程均值可能落在任何地方)
+             # 但必须排除 > 4.05 的情况
+             # 计算 min/max inferred 看看是否完全超标
+             pass # 继续往下算 range
+             
+        # 计算 Old 和 New 的真实总分可能范围 (反向去四舍五入)
+        # GPA 3.00 -> [2.995, 3.005)
+        old_gpa_min = old_s.gpa - 0.005
+        old_gpa_max = old_s.gpa + 0.005
+        
+        new_gpa_min = new_s.gpa - 0.005
+        new_gpa_max = new_s.gpa + 0.005
+        
+        # 推断出的学分绩点 X 的范围:
+        # X = (NewTotal - OldTotal) / Diff
+        # Min X occurs when New is smallest and Old is largest
+        inf_min = (new_gpa_min * new_s.credits - old_gpa_max * old_s.credits) / credit_diff
+        # Max X occurs when New is largest and Old is smallest
+        inf_max = (new_gpa_max * new_s.credits - old_gpa_min * old_s.credits) / credit_diff
+        
+        # 检查是否与任意合法区间有交集
+        has_overlap = False
+        
+        # 如果是大额更新，我们只检查总体界限，因为多门课平均分可以是任意值(如3.49)，会填补Gap
+        if credit_diff >= 4.5:
+            # 大额更新允许落在 Gap 里 (如 3.49)，只要不超出 4.05 或低于 -0.1
+             if inf_max >= -0.1 and inf_min <= 4.05:
+                 return True
+             return False
+        
+        # 小额更新，必须落在特定区间内
+        for (v_min, v_max) in valid_intervals:
+            # 检查区间 [inf_min, inf_max] 与 [v_min, v_max] 是否重叠
+            if max(inf_min, v_min) < min(inf_max, v_max):
+                has_overlap = True
+                break
+                
+        # 特殊处理 PNP (如果开启)
+        if not has_overlap and infer_pnp:
+             # PNP 通常是 0 左右
+             if max(inf_min, -0.1) < min(inf_max, 0.1):
+                 has_overlap = True
+                 
+        return has_overlap
         
         # 保存推断结果
         if inferences:
