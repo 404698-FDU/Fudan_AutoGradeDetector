@@ -26,7 +26,7 @@
 确保已安装 Python 3.8+。
 
 ```bash
-git clone https://github.com/yourusername/AutoGradeDetector.git
+git clone https://github.com/404698-FDU/Fudan_AutoGradeDetector.git
 cd AutoGradeDetector
 
 pip install -r requirements.txt
@@ -65,7 +65,7 @@ HEADLESS=true               # 是否隐藏浏览器窗口 (调试时可设为 fa
 # ---高级功能开关---
 CURRENT_SEMESTER=           # 指定学期(如 2025-2026-1)，留空自动获取
 INFER_GRADES=true           # 开启成绩推断功能
-INFER_PNP=true              # 开启 P/NP 课程识别
+INFER_PNP=false             # 开启 P/NP 课程识别
 ENABLE_DEPARTMENT_MONITORING=false # 开启院系排名监控 (实验性功能)
 DEPARTMENT_NAME=软件学院    # 你的院系名称 (仅当开启院系监控时需要)
 ```
