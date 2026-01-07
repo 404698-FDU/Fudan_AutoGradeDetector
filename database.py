@@ -476,8 +476,116 @@ class RankingDatabase:
 
     def _match_students_in_major(self, old_students: list[MajorStudentRanking], new_students: list[MajorStudentRanking], semester: str, infer_pnp: bool) -> tuple[list[GradeInference], bool]:
         """
-        在单个专业内部执行全局优先匹配算法 (Global Priority Matching)
-        解决顺序依赖问题：优先选择"质量最高"的匹配，而不是"先来后到"
+        在单个专业内部执行全局最优匹配算法 (Hungarian Algorithm)
+        使用 scipy.optimize.linear_sum_assignment 实现二分图最优匹配
+        确保全局代价最小，而不是贪心局部最优
+        """
+        inferences = []
+        has_changed = False
+        
+        n_old = len(old_students)
+        n_new = len(new_students)
+        
+        if n_old == 0 or n_new == 0:
+            # 边界情况
+            has_changed = n_new > 0
+            return inferences, has_changed
+        
+        # === 构建代价矩阵 (Cost Matrix) ===
+        # cost[i][j] = 匹配 old[i] -> new[j] 的代价
+        # 代价越低越好，使用负分数作为代价
+        # 无效匹配使用极大代价 (INF)
+        
+        INF = 1e9
+        cost_matrix = [[INF] * n_new for _ in range(n_old)]
+        match_info = {}  # (old_idx, new_idx) -> {'type': 'exact'/'inference', 'diff': credit_diff}
+        
+        for old_idx, old_s in enumerate(old_students):
+            for new_idx, new_s in enumerate(new_students):
+                
+                credit_diff = new_s.credits - old_s.credits
+                gpa_diff = abs(new_s.gpa - old_s.gpa)
+                rank_dist = abs(new_s.rank - old_s.rank)
+                
+                # --- A. 精确匹配 (Exact) ---
+                if abs(credit_diff) < 0.001 and gpa_diff < 0.001:
+                    # 最高优先级，使用强负代价确保绝对优先
+                    # -10000 基准，加上 Rank Penalty 防止"同分学生"身份互换
+                    cost = -10000 + rank_dist * 1.0  # 增强 Rank 惩罚
+                    cost_matrix[old_idx][new_idx] = cost
+                    match_info[(old_idx, new_idx)] = {'type': 'exact', 'diff': 0}
+                    continue
+                
+                # --- B. 推断匹配 (Inference) ---
+                if 0.5 <= credit_diff <= 15:
+                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    if not is_valid:
+                        continue  # 保持 INF 代价
+                    
+                    # 计算代价 (越低越好)
+                    # 基础代价 = 100 (所有有效推断的基线)
+                    cost = 100
+                    
+                    # 1. 学分变动幅度惩罚 (越大代价越高)
+                    if credit_diff >= 5.0:
+                        cost += 500  # 大幅惩罚 >= 5.0 的匹配
+                    
+                    # 2. 非整数惩罚
+                    is_integer = abs(credit_diff - round(credit_diff)) < 0.001
+                    if not is_integer:
+                        cost += 50
+                    
+                    # 3. 变动幅度线性惩罚
+                    cost += credit_diff * 10
+                    
+                    # 4. Rank Penalty (Tie-breaker)
+                    cost += rank_dist * 0.1
+                    
+                    cost_matrix[old_idx][new_idx] = cost
+                    match_info[(old_idx, new_idx)] = {'type': 'inference', 'diff': credit_diff}
+        
+        # === 运行匈牙利算法 ===
+        try:
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        except ImportError:
+            # 如果 scipy 不可用，回退到贪心算法
+            return self._match_students_greedy_fallback(old_students, new_students, semester, infer_pnp)
+        
+        # === 处理匹配结果 ===
+        used_new_indices = set()
+        
+        for old_idx, new_idx in zip(row_ind, col_ind):
+            cost = cost_matrix[old_idx][new_idx]
+            
+            # 跳过无效匹配 (INF 代价)
+            if cost >= INF - 1:
+                continue
+            
+            used_new_indices.add(new_idx)
+            
+            key = (old_idx, new_idx)
+            if key in match_info:
+                info = match_info[key]
+                
+                if info['type'] == 'inference':
+                    has_changed = True
+                    old_s = old_students[old_idx]
+                    new_s = new_students[new_idx]
+                    inference = GradeInference.from_change(old_s, new_s, semester, infer_pnp=infer_pnp)
+                    if inference:
+                        inferences.append(inference)
+                # Exact match - just mark as used, no inference
+        
+        # 检查未匹配的新记录 (新增学生)
+        if len(used_new_indices) < n_new:
+            has_changed = True
+             
+        return inferences, has_changed
+    
+    def _match_students_greedy_fallback(self, old_students: list[MajorStudentRanking], new_students: list[MajorStudentRanking], semester: str, infer_pnp: bool) -> tuple[list[GradeInference], bool]:
+        """
+        当 scipy 不可用时的贪心回退算法
         """
         inferences = []
         has_changed = False
@@ -486,29 +594,17 @@ class RankingDatabase:
         used_old_indices = set()
         used_new_indices = set()
         
-        # === 全局评分匹配 (Unified Global Scorer) ===
-        # 将 "精确匹配" 和 "推断匹配" 统一在同一个池子中竞争
-        # 引入 Rank Distance 作为 Tie-breaker，解决同分碰撞时的身份漂移问题
+        candidates = []
         
-        candidates = [] # list of (score, new_idx, old_idx, credit_diff, priority_type)
-        
-        # 遍历所有组合
         for new_idx, new_s in enumerate(new_students):
             for old_idx, old_s in old_map.items():
                 
                 credit_diff = new_s.credits - old_s.credits
                 gpa_diff = abs(new_s.gpa - old_s.gpa)
                 
-                # --- 统一评分 (Unified Scoring) ---
-                # A. 精确匹配 (Exact)
+                # Exact Match
                 if abs(credit_diff) < 0.001 and gpa_diff < 0.001:
-                    # 视为 Diff=0 的极佳匹配
-                    # 给一个巨大的 Base 分数，确保 "无变化" 的人永远优先匹配自己，
-                    # 即使因为别人成绩变化导致自己的 Rank 发生了巨大偏移 (Rank Penalty)。
-                    # 10000 分足以抵抗 Rank Dist * 0.5 (即使 1000名差距也才扣 500分)
                     score = 10000 
-                    
-                    # Rank Penalty (Still applied as tie-breaker for identical exact matches)
                     rank_dist = abs(new_s.rank - old_s.rank)
                     score -= rank_dist * 0.5
                     
@@ -521,29 +617,19 @@ class RankingDatabase:
                     })
                     continue
                 
-                # B. 推断匹配 (Inference)
+                # Inference
                 if 0.5 <= credit_diff <= 15:
-                    old_weighted = old_s.gpa * old_s.credits
-                    new_weighted = new_s.gpa * new_s.credits
-                    inferred_gpa = (new_weighted - old_weighted) / credit_diff
-                    
                     is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
                     if not is_valid: continue
                     
                     score = 0
-                    
-                    # 1. 学分变动幅度
                     if credit_diff < 5.0: score += 1000
-                    else: score += 0
                     
-                    # 2. 整数偏好
                     is_integer = abs(credit_diff - round(credit_diff)) < 0.001
                     if is_integer: score += 500
                     
-                    # 3. 变动幅度惩罚
                     score -= credit_diff
                     
-                    # 4. Rank Penalty
                     rank_dist = abs(new_s.rank - old_s.rank)
                     score -= rank_dist * 0.5
 
@@ -555,10 +641,8 @@ class RankingDatabase:
                         'type': 'inference'
                     })
         
-        # 按分数降序排序
         candidates.sort(key=lambda x: x['score'], reverse=True)
         
-        # 贪心消耗
         for cand in candidates:
             n_idx = cand['new_idx']
             o_idx = cand['old_idx']
@@ -566,26 +650,18 @@ class RankingDatabase:
             if n_idx in used_new_indices or o_idx in used_old_indices:
                 continue
                 
-            # Lock It
             used_new_indices.add(n_idx)
             used_old_indices.add(o_idx)
             
             if cand['type'] == 'inference':
-                # 只有推断匹配才生成 Inference (精确匹配不算变化)
                 has_changed = True
-                matches_found_flag = True
-                
                 old_s = old_map[o_idx]
                 new_s = new_students[n_idx]
                 inference = GradeInference.from_change(old_s, new_s, semester, infer_pnp=infer_pnp)
                 if inference:
                     inferences.append(inference)
-            else:
-                # Exact match - do nothing but mark used
-                pass 
                 
-        # 检查是否有未匹配的新增条目 (视为变化)
-        if matches_found_flag or len(used_new_indices) < len(new_students):
+        if len(used_new_indices) < len(new_students):
              has_changed = True
              
         return inferences, has_changed
