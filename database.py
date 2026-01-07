@@ -526,19 +526,25 @@ class RankingDatabase:
                     # 基础代价 = 100 (所有有效推断的基线)
                     cost = 100
                     
-                    # 1. 学分变动幅度惩罚 (越大代价越高)
+                    # === 用户规则 1: 大额学分惩罚 (>=5.0) ===
+                    # "除非只能如此匹配，否则不可能同时出分太多门课程"
                     if credit_diff >= 5.0:
-                        cost += 500  # 大幅惩罚 >= 5.0 的匹配
+                        cost += 2000  # 大幅惩罚，几乎等于"最后选择"
+                    elif credit_diff >= 4.0:
+                        cost += 500   # 中等惩罚
                     
-                    # 2. 非整数惩罚
+                    # === 用户规则 2: 小数学分惩罚 ===
+                    # "形式与政策是唯一带半学分的课程，大多数已经出分"
                     is_integer = abs(credit_diff - round(credit_diff)) < 0.001
                     if not is_integer:
-                        cost += 50
+                        # 0.5 学分变动 -> 额外惩罚
+                        cost += 300  # 大幅惩罚小数学分
                     
-                    # 3. 变动幅度线性惩罚
+                    # === 规则 3: 学分变动幅度线性惩罚 ===
+                    # 优先小变动
                     cost += credit_diff * 10
                     
-                    # 4. Rank Penalty (Tie-breaker)
+                    # === 规则 4: Rank 稳定性惩罚 ===
                     cost += rank_dist * 0.1
                     
                     cost_matrix[old_idx][new_idx] = cost
@@ -725,6 +731,14 @@ class RankingDatabase:
             if max(inf_min, v_min) < min(inf_max, v_max):
                 has_overlap = True
                 break
+        
+        # === 新增：检查是否与原绩点相近 ===
+        # 如果推断绩点接近原累计绩点，说明新课程成绩恰好等于累计绩点
+        # 这是完全合理的情况
+        if not has_overlap:
+            old_gpa = old_s.gpa
+            if max(inf_min, old_gpa - 0.1) < min(inf_max, old_gpa + 0.1):
+                has_overlap = True
                 
         # 特殊处理 PNP (如果开启)
         if not has_overlap and infer_pnp:
