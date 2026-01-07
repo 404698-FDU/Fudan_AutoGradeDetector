@@ -421,30 +421,78 @@ class RankingDatabase:
         if not latest_snapshot:
             return True, [], inferences
         
-        # === 新匹配算法：基于学分变化匹配 ===
-        # 由于姓名脱敏，使用学分作为近似标识
-        # 策略：找出学分发生变化的学生（学分增加说明有新成绩）
+        # === 优化 1: 按专业分组 (Partition by Major) ===
+        # 减少推断范围，避免跨专业错误匹配
+        # 用户反馈: "同专业推断出的结果...减少全学院其他专业推断...一一对应"
         
-        # 建立旧快照的索引映射，并标记已被匹配的旧记录
-        # old_students 是一个列表，我们需要通过索引来标记“已使用”
-        old_students_map = {i: s for i, s in enumerate(latest_snapshot)}
-        used_old_indices = set()
+        from collections import defaultdict
         
+        # 分组 New Snapshot
+        new_by_major = defaultdict(list)
+        # 建立原始索引映射，以便后续定位
+        new_indices_map = defaultdict(list) 
+        for i, s in enumerate(students):
+            new_by_major[s.major].append(s)
+            new_indices_map[s.major].append(i)
+            
+        # 分组 Old Snapshot
+        old_by_major = defaultdict(list)
+        for s in latest_snapshot:
+            old_by_major[s.major].append(s)
+            
         has_changed = False
-        unmatched_new_indices = []  # 第一轮未匹配的新记录索引
         
-        # === 第一轮：精确匹配（GPA和学分完全相同）===
-        # 优先匹配“无变化”的情况
-        for new_idx, new_s in enumerate(students):
+        # 对每个专业独立执行匹配算法
+        for major_name, major_new_students in new_by_major.items():
+            major_old_students = old_by_major.get(major_name, [])
+            
+            # 如果该专业在旧快照中不存在，说明全是新人，标记变更但不推断
+            if not major_old_students:
+                has_changed = True
+                continue
+                
+            # 执行匹配 (Helper Logic)
+            major_inferences, major_changed = self._match_students_in_major(
+                major_old_students, major_new_students, semester, infer_pnp
+            )
+            
+            if major_changed:
+                has_changed = True
+            if major_inferences:
+                inferences.extend(major_inferences)
+                
+        # 检查是否有未处理的旧专业 (旧快照有，新快照没了) -> 这种算变更
+        for old_major in old_by_major:
+            if old_major not in new_by_major:
+                has_changed = True
+        
+        # 保存推断结果
+        if inferences:
+            self.save_inferences(inferences)
+        
+        return has_changed, latest_snapshot, inferences
+
+    def _match_students_in_major(self, old_students: list[MajorStudentRanking], new_students: list[MajorStudentRanking], semester: str, infer_pnp: bool) -> tuple[list[GradeInference], bool]:
+        """
+        在单个专业内部执行双轮匹配算法
+        返回: (inferences, has_changed)
+        """
+        inferences = []
+        has_changed = False
+        
+        # 建立旧记录索引映射
+        old_map = {i: s for i, s in enumerate(old_students)}
+        used_old_indices = set()
+        unmatched_new_indices = []
+        
+        # === 第一轮：精确匹配 ===
+        for new_idx, new_s in enumerate(new_students):
             matched = False
-            # 在所有未使用的旧记录中寻找完全匹配
-            for old_idx, old_s in old_students_map.items():
+            for old_idx, old_s in old_map.items():
                 if old_idx in used_old_indices:
                     continue
                 
-                # 判定完全相同：学分和 GPA 差值都在允许误差范围内
                 if abs(old_s.credits - new_s.credits) < 0.001 and abs(old_s.gpa - new_s.gpa) < 0.001:
-                    # 找到匹配，标记并跳出
                     used_old_indices.add(old_idx)
                     matched = True
                     break
@@ -452,83 +500,84 @@ class RankingDatabase:
             if not matched:
                 unmatched_new_indices.append(new_idx)
         
-        # === 第二轮：推断匹配（尝试解释剩下的新记录）===
-        # 对于未匹配的新记录，尝试在未使用的旧记录中寻找“合理推断”
+        # === 第二轮：推断匹配 ===
         for new_idx in unmatched_new_indices:
-            new_s = students[new_idx]
+            new_s = new_students[new_idx]
             
             best_match_idx = -1
             best_credit_diff = float('inf')
-            best_is_integer = False  # 记录当前最佳匹配是否为整数变化
+            best_is_integer = False
+            best_is_small_update = False # 记录是否为小额更新 (< 5.0 学分)
             
-            # 遍历所有未使用的旧记录
-            for old_idx, old_s in old_students_map.items():
+            for old_idx, old_s in old_map.items():
                 if old_idx in used_old_indices:
                     continue
                 
                 credit_diff = new_s.credits - old_s.credits
                 
-                # 只考虑学分增加的情况（0.5 - 10 学分之间的合理增量）
-                if 0.5 <= credit_diff <= 10:
-                    # 计算推断绩点
+                # 放宽上限到 15 以兼容极端情况，但在优先级中惩罚 >= 5.0
+                if 0.5 <= credit_diff <= 15:
                     old_weighted = old_s.gpa * old_s.credits
                     new_weighted = new_s.gpa * new_s.credits
                     inferred_gpa = (new_weighted - old_weighted) / credit_diff
                     
-                    # 严格判定合理性：
-                    # 1. 正常区间: [1.25, 4.05] (允许少量四舍五入误差超过4.0)
-                    # 2. 挂科/P/NP区间: [-0.1, 0.1]
-                    # 用户反馈: < 1.3 但非 0 则可能为匹配错误
                     is_reasonable = False
-                    
                     if 1.25 <= inferred_gpa <= 4.05:
                         is_reasonable = True
                     elif -0.1 <= inferred_gpa <= 0.1:
-                         # 可能是挂科(0) 或 P/NP (通常推断为0附近，如果启用 PNP 则接受)
-                         if infer_pnp: 
-                             is_reasonable = True
-                         elif abs(inferred_gpa) <= 0.05: # 如果不启用PNP，但确实是0 (挂科)，也接受
-                             is_reasonable = True
+                         if infer_pnp: is_reasonable = True
+                         elif abs(inferred_gpa) <= 0.05: is_reasonable = True
 
                     if is_reasonable:
-                        # 优化匹配优先级：
-                        # 1. 优先选择整数倍学分变化（大多数课程学分为整数，2.0, 3.0 等）
-                        #    用户反馈：除非没有其他匹配，尽量不要识别小数（如 0.5 形策）
-                        # 2. 如果优先级相同，选择学分差最小的
+                        # === 优先级策略 V2 ===
+                        # 1. 学分变动量 < 5.0 (Priority High) vs >= 5.0 (Priority Low)
+                        #    用户反馈: "除非只能如此匹配，否则...匹配 >= 5分...重新尝试"
+                        # 2. 整数变动 (Priority High) vs 小数变动 (Priority Low)
+                        # 3. 变动量越小越好
                         
                         is_integer = abs(credit_diff - round(credit_diff)) < 0.001
+                        is_small_update = credit_diff < 5.0
+                        
                         replace_best = False
                         
                         if best_match_idx == -1:
                             replace_best = True
-                        elif is_integer and not best_is_integer:
-                            # 优先级提升：找到整数匹配，替换掉之前的小数匹配
-                            replace_best = True
-                        elif not is_integer and best_is_integer:
-                            # 优先级降低：当前是小数，已找到整数，忽略
-                            replace_best = False
                         else:
-                            # 优先级相同：择优选择学分差更小的
-                            if credit_diff < best_credit_diff:
+                            # 比较当前侯选 (Current) vs 最佳侯选 (Best)
+                            
+                            # 规则 1: 优先选 < 5.0 的更新
+                            if is_small_update and not best_is_small_update:
                                 replace_best = True
+                            elif not is_small_update and best_is_small_update:
+                                replace_best = False
+                            else:
+                                # 规则 1 平局，看规则 2: 优先选整数
+                                if is_integer and not best_is_integer:
+                                    replace_best = True
+                                elif not is_integer and best_is_integer:
+                                    replace_best = False
+                                else:
+                                    # 规则 2 平局，看规则 3: 选更小的变动
+                                    if credit_diff < best_credit_diff:
+                                        replace_best = True
                         
                         if replace_best:
                             best_credit_diff = credit_diff
                             best_match_idx = old_idx
                             best_is_integer = is_integer
+                            best_is_small_update = is_small_update
             
             if best_match_idx != -1:
-                # 找到最佳匹配，生成推断结果
                 has_changed = True
                 used_old_indices.add(best_match_idx)
-                old_s = old_students_map[best_match_idx]
-                
+                old_s = old_map[best_match_idx]
                 inference = GradeInference.from_change(old_s, new_s, semester, infer_pnp=infer_pnp)
                 if inference:
                     inferences.append(inference)
             else:
-                # 仍然没找到匹配，说明是完全的新增人员（如转专业）或者数据变动过大无法推断
                 has_changed = True
+                
+        return inferences, has_changed
         
         # 保存推断结果
         if inferences:
