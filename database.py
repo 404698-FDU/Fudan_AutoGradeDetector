@@ -225,6 +225,8 @@ class RankingDatabase:
                 )
             ''')
             # 全专业排名快照表 (含学期字段)
+            # track_name 用于标识监控目标（如“软件工程”或“计算与智能创新学院”）
+            # major 用于存储学生的实际专业名
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS major_rankings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,11 +236,22 @@ class RankingDatabase:
                     gpa REAL NOT NULL,
                     credits REAL NOT NULL,
                     major TEXT NOT NULL,
+                    track_name TEXT,
                     semester TEXT DEFAULT '',
                     is_me INTEGER DEFAULT 0,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # --- 自动迁移: 为旧表添加 track_name 字段 ---
+            cursor = conn.execute("PRAGMA table_info(major_rankings)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'track_name' not in columns:
+                logger.info("正在为 major_rankings 表添加 track_name 字段...")
+                conn.execute("ALTER TABLE major_rankings ADD COLUMN track_name TEXT")
+                # 初始数据迁移：将原有的 major 拷贝到 track_name
+                conn.execute("UPDATE major_rankings SET track_name = major WHERE track_name IS NULL")
+                conn.commit()
             # 成绩推断记录表
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS grade_inferences (
@@ -319,24 +332,25 @@ class RankingDatabase:
         
         return has_changed
     
-    def save_major_rankings(self, major: str, students: list[MajorStudentRanking]) -> tuple[bool, list[MajorStudentRanking]]:
+    def save_major_rankings(self, track_name: str, students: list[MajorStudentRanking]) -> tuple[bool, list[MajorStudentRanking]]:
         """
         保存专业全员排名快照
+        track_name: 监控目标（如专业名或院系名）
         返回 (是否有变动, 上一次的快照列表)
         """
         import uuid
         snapshot_id = str(uuid.uuid4())
         
-        # 获取上一个快照进行对比
-        latest_snapshot = self.get_latest_major_rankings(major)
+        # 获取上一个快照进行对比 (通过 track_name)
+        latest_snapshot = self.get_latest_major_rankings(track_name)
         
         # 保存新快照
         with sqlite3.connect(self.db_path) as conn:
             for s in students:
                 conn.execute('''
-                    INSERT INTO major_rankings (snapshot_id, rank, name, gpa, credits, major, is_me)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (snapshot_id, s.rank, s.name, s.gpa, s.credits, s.major, 1 if s.is_me else 0))
+                    INSERT INTO major_rankings (snapshot_id, rank, name, gpa, credits, major, track_name, is_me)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (snapshot_id, s.rank, s.name, s.gpa, s.credits, s.major, track_name, 1 if s.is_me else 0))
             conn.commit()
             
         # 对比逻辑
@@ -363,21 +377,20 @@ class RankingDatabase:
                 
         return has_changed, latest_snapshot
 
-    def get_latest_major_rankings(self, major: str, semester: str = "") -> list[MajorStudentRanking]:
-        """获取最新的全员排名快照，可按学期筛选"""
+    def get_latest_major_rankings(self, track_name: str, semester: str = "") -> list[MajorStudentRanking]:
+        """获取最新的全员排名快照，按 track_name (监控目标) 查找"""
         with sqlite3.connect(self.db_path) as conn:
             # 先找最新的 snapshot_id
             if semester:
                 cursor = conn.execute(
-                    'SELECT snapshot_id FROM major_rankings WHERE major = ? AND semester = ? ORDER BY timestamp DESC LIMIT 1',
-                    (major, semester)
+                    'SELECT snapshot_id FROM major_rankings WHERE track_name = ? AND semester = ? ORDER BY timestamp DESC LIMIT 1',
+                    (track_name, semester)
                 )
             else:
                 # 当 semester 为空时，明确查找 semester 为空字符串或 NULL 的记录
-                # 否则可能会获取到带学期的快照（如最新的本学期推断快照）
                 cursor = conn.execute(
-                    "SELECT snapshot_id FROM major_rankings WHERE major = ? AND (semester = '' OR semester IS NULL) ORDER BY timestamp DESC LIMIT 1",
-                    (major,)
+                    "SELECT snapshot_id FROM major_rankings WHERE track_name = ? AND (semester = '' OR semester IS NULL) ORDER BY timestamp DESC LIMIT 1",
+                    (track_name,)
                 )
             row = cursor.fetchone()
             if not row:
@@ -397,12 +410,12 @@ class RankingDatabase:
                 for r in cursor.fetchall()
             ]
 
-    def save_semester_rankings(self, major: str, semester: str, students: list[MajorStudentRanking], infer_pnp: bool = True) -> tuple[bool, list[MajorStudentRanking], list[GradeInference]]:
+    def save_semester_rankings(self, track_name: str, semester: str, students: list[MajorStudentRanking], infer_pnp: bool = True) -> tuple[bool, list[MajorStudentRanking], list[GradeInference]]:
         """
         保存按学期的专业排名快照
         
         Args:
-            major: 专业名称
+            track_name: 监控目标（专业或院系名）
             semester: 学期
             students: 学生排名列表
             infer_pnp: 是否启用 P/NP 课程自动识别
@@ -412,16 +425,16 @@ class RankingDatabase:
         import uuid
         snapshot_id = str(uuid.uuid4())
         
-        # 获取上一个快照进行对比
-        latest_snapshot = self.get_latest_major_rankings(major, semester)
+        # 获取上一个快照进行对比 (通过 track_name)
+        latest_snapshot = self.get_latest_major_rankings(track_name, semester)
         
         # 保存新快照
         with sqlite3.connect(self.db_path) as conn:
             for s in students:
                 conn.execute('''
-                    INSERT INTO major_rankings (snapshot_id, rank, name, gpa, credits, major, semester, is_me)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (snapshot_id, s.rank, s.name, s.gpa, s.credits, s.major, semester, 1 if s.is_me else 0))
+                    INSERT INTO major_rankings (snapshot_id, rank, name, gpa, credits, major, track_name, semester, is_me)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (snapshot_id, s.rank, s.name, s.gpa, s.credits, s.major, track_name, semester, 1 if s.is_me else 0))
             conn.commit()
         
         # 推断成绩
@@ -700,12 +713,6 @@ class RankingDatabase:
                  has_overlap = True
                  
         return has_overlap
-        
-        # 保存推断结果
-        if inferences:
-            self.save_inferences(inferences)
-        
-        return has_changed, latest_snapshot, inferences
 
     def _try_unify_credit_diffs(
         self, 
