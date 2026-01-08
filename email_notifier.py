@@ -353,7 +353,7 @@ class EmailNotifier:
         """发送全员排名变动通知 (完整版)"""
         try:
             msg = MIMEMultipart('alternative')
-            msg['Subject'] = f'📢 {scope_label}排名变动通知 - {major} (完整榜单)'
+            msg['Subject'] = f'📢 [{scope_label}] 排名变动通知 - {major} (完整榜单)'
             msg['From'] = self.sender
             msg['To'] = self.receiver
             
@@ -465,8 +465,8 @@ class EmailNotifier:
         
         try:
             msg = MIMEMultipart('alternative')
-            # 邮件标题包含变化人数
-            msg['Subject'] = f'🔍 有 {len(inferences)} 个人的学分发生变化 - {major} ({semester})'
+            # 邮件标题包含变化人数和范围标签
+            msg['Subject'] = f'🔍 [{scope_label}] 有 {len(inferences)} 个人的学分发生变化 - {major} ({semester})'
             msg['From'] = self.sender
             msg['To'] = self.receiver
             
