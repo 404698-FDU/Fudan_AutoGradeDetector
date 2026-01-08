@@ -604,6 +604,7 @@ class RankingDatabase:
         """
         inferences = []
         has_changed = False
+        matches_found_flag = False  # 初始化标志，避免 UnboundLocalError
         
         old_map = {i: s for i, s in enumerate(old_students)}
         used_old_indices = set()
