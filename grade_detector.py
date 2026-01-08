@@ -808,18 +808,23 @@ class FudanGradeDetector:
         if not current_rankings:
             logger.warning(f'未获取到全{scope_name}排名数据')
             return False
-            
-        major = current_rankings[0].major if current_rankings else "软件工程"
+        
+        # 确定用于快照查询的名称
+        # - 专业监控: 使用第一个学生的专业名
+        # - 院系监控: 使用院系名称（所有专业的学生作为一个整体比较）
+        if scope == "department":
+            snapshot_name = Config.DEPARTMENT_NAME
+        else:
+            snapshot_name = current_rankings[0].major if current_rankings else "软件工程"
         
         # 保存快照并获取变动详情
-        # 即使是院系排名，也可以复用 major_rankings 表，只要 major 字段存的是院系名即可
-        changed, previous_rankings = self.ranking_db.save_major_rankings(major, current_rankings)
+        changed, previous_rankings = self.ranking_db.save_major_rankings(snapshot_name, current_rankings)
         
         if changed:
             logger.info(f'发现全{scope_name}排名变动！正在发送通知...')
             # 发送通知时需传入 scope_label
             scope_label = "院系" if scope == "department" else "专业"
-            self.notifier.send_major_ranking_update(major, current_rankings, previous_rankings, scope_label=scope_label)
+            self.notifier.send_major_ranking_update(snapshot_name, current_rankings, previous_rankings, scope_label=scope_label)
         else:
             logger.info(f'全{scope_name}排名无变动')
             
