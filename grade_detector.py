@@ -849,11 +849,15 @@ class FudanGradeDetector:
             logger.warning(f'未能获取到当前学期{scope_name}排名数据')
             return result
         
-        major = current_rankings[0].major if current_rankings else "软件工程"
-        
+        # 确定用于快照查询的名称
+        if scope == "department":
+            snapshot_name = Config.DEPARTMENT_NAME
+        else:
+            snapshot_name = current_rankings[0].major if current_rankings else "软件工程"
+            
         # 保存快照并获取推断结果
         changed, previous_rankings, inferences = self.ranking_db.save_semester_rankings(
-            major, semester, current_rankings, infer_pnp=Config.INFER_PNP
+            snapshot_name, semester, current_rankings, infer_pnp=Config.INFER_PNP
         )
         
         result['changed'] = changed
