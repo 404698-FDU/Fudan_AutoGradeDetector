@@ -357,7 +357,7 @@ class EmailNotifier:
             msg['From'] = self.sender
             msg['To'] = self.receiver
             
-            text_content = f'全{scope_label}排名完整变动通知\n{scope_label}: {major}\n总人数: {len(current)}'
+            text_content = f' [Main] 全{scope_label}排名完整变动通知\n{scope_label}: {major}\n总人数: {len(current)}'
             html_content = self._create_major_ranking_html(major, current, previous, scope_label)
             
             msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
@@ -466,7 +466,7 @@ class EmailNotifier:
         try:
             msg = MIMEMultipart('alternative')
             # 邮件标题包含变化人数和范围标签
-            msg['Subject'] = f'🔍 [{scope_label}] 有 {len(inferences)} 个人的学分发生变化 - {major} ({semester})'
+            msg['Subject'] = f'🔍 [Main] [{scope_label}] 有 {len(inferences)} 个人的学分发生变化 - {major} ({semester})'
             msg['From'] = self.sender
             msg['To'] = self.receiver
             
