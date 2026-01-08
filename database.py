@@ -346,11 +346,20 @@ class RankingDatabase:
         if len(latest_snapshot) != len(students):
             return True, latest_snapshot
             
-        has_changed = False
-        for old, new in zip(latest_snapshot, students):
-            if old.rank != new.rank or abs(old.gpa - new.gpa) > 0.0001 or abs(old.credits - new.credits) > 0.0001:
-                has_changed = True
-                break
+        # 使用 (gpa, credits) 元组集合进行内容比较
+        # 忽略排名顺序变化，只检测实际数据变化
+        def make_content_set(snapshot):
+            """将快照转换为 (gpa, credits) 的 frozenset，用于内容比较"""
+            # 使用四舍五入到4位小数避免浮点精度问题
+            return frozenset(
+                (round(s.gpa, 4), round(s.credits, 4)) 
+                for s in snapshot
+            )
+        
+        old_content = make_content_set(latest_snapshot)
+        new_content = make_content_set(students)
+        
+        has_changed = old_content != new_content
                 
         return has_changed, latest_snapshot
 
