@@ -2,11 +2,14 @@
 SQLite 数据库模块
 用于存储和查询成绩历史记录
 """
+import logging
 import sqlite3
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -732,9 +735,6 @@ class RankingDatabase:
         2. 找到众数（出现最多的整数学分值）
         3. 对于学分不等于众数的推断，尝试找替代匹配
         """
-        import logging
-        logger = logging.getLogger(__name__)
-        
         if len(inferences) < 2:
             return inferences
             
