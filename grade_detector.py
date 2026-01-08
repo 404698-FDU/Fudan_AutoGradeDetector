@@ -729,12 +729,9 @@ class FudanGradeDetector:
                     # 判断是否是自己（名字未被脱敏）
                     is_me = (name != "****" and name is not None)
                     
-                    # 确定专业/院系名称
-                    major_name = "软件工程"
-                    if scope == 'department':
-                        major_name = Config.DEPARTMENT_NAME
-                    else:
-                        major_name = item.get('majorName') or item.get('major') or "软件工程"
+                    # 确定专业名称 - 始终使用 API 返回的实际专业（用于分组匹配）
+                    # 无论是专业监控还是院系监控，都保留学生的实际专业名称
+                    major_name = item.get('majorName') or item.get('major') or "软件工程"
 
                     students.append(MajorStudentRanking(
                         rank=item.get('ranking'),

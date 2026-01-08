@@ -487,7 +487,15 @@ class RankingDatabase:
         """
         在单个专业内部执行全局优先匹配算法 (Global Priority Matching)
         解决顺序依赖问题：优先选择"质量最高"的匹配，而不是"先来后到"
+        
+        增强：两阶段同学分约束
+        - 阶段1: 预扫描找到最可能的公共学分差（众数）
+        - 阶段2: 对学分差等于众数的匹配给予额外奖励
         """
+        import logging
+        from collections import Counter
+        logger = logging.getLogger(__name__)
+        
         inferences = []
         has_changed = False
         matches_found_flag = False  # 初始化标志，避免 UnboundLocalError
@@ -496,29 +504,45 @@ class RankingDatabase:
         used_old_indices = set()
         used_new_indices = set()
         
-        # === 全局评分匹配 (Unified Global Scorer) ===
-        # 将 "精确匹配" 和 "推断匹配" 统一在同一个池子中竞争
-        # 引入 Rank Distance 作为 Tie-breaker，解决同分碰撞时的身份漂移问题
+        # === 阶段1: 预扫描找到众数学分差 ===
+        # 收集所有有效推断匹配的学分差，取整数后统计众数
+        pre_scan_diffs = []
+        for new_idx, new_s in enumerate(new_students):
+            for old_idx, old_s in old_map.items():
+                credit_diff = new_s.credits - old_s.credits
+                gpa_diff = abs(new_s.gpa - old_s.gpa)
+                
+                # 跳过精确匹配
+                if abs(credit_diff) < 0.001 and gpa_diff < 0.001:
+                    continue
+                    
+                # 只考虑有效的推断匹配
+                if 0.5 <= credit_diff <= 15:
+                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    if is_valid:
+                        pre_scan_diffs.append(round(credit_diff))
         
-        candidates = [] # list of (score, new_idx, old_idx, credit_diff, priority_type)
+        # 计算众数
+        target_credit_diff = None
+        if pre_scan_diffs:
+            diff_counter = Counter(pre_scan_diffs)
+            most_common = diff_counter.most_common(1)
+            if most_common and most_common[0][1] >= 2:
+                target_credit_diff = most_common[0][0]
+                logger.debug(f'同学分约束: 预扫描众数={target_credit_diff}学分 (出现{most_common[0][1]}次)')
         
-        # 遍历所有组合
+        # === 阶段2: 全局评分匹配 (加入同学分奖励) ===
+        candidates = []
+        
         for new_idx, new_s in enumerate(new_students):
             for old_idx, old_s in old_map.items():
                 
                 credit_diff = new_s.credits - old_s.credits
                 gpa_diff = abs(new_s.gpa - old_s.gpa)
                 
-                # --- 统一评分 (Unified Scoring) ---
                 # A. 精确匹配 (Exact)
                 if abs(credit_diff) < 0.001 and gpa_diff < 0.001:
-                    # 视为 Diff=0 的极佳匹配
-                    # 给一个巨大的 Base 分数，确保 "无变化" 的人永远优先匹配自己，
-                    # 即使因为别人成绩变化导致自己的 Rank 发生了巨大偏移 (Rank Penalty)。
-                    # 10000 分足以抵抗 Rank Dist * 0.5 (即使 1000名差距也才扣 500分)
                     score = 10000 
-                    
-                    # Rank Penalty (Still applied as tie-breaker for identical exact matches)
                     rank_dist = abs(new_s.rank - old_s.rank)
                     score -= rank_dist * 0.5
                     
@@ -533,10 +557,6 @@ class RankingDatabase:
                 
                 # B. 推断匹配 (Inference)
                 if 0.5 <= credit_diff <= 15:
-                    old_weighted = old_s.gpa * old_s.credits
-                    new_weighted = new_s.gpa * new_s.credits
-                    inferred_gpa = (new_weighted - old_weighted) / credit_diff
-                    
                     is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
                     if not is_valid: continue
                     
@@ -544,7 +564,6 @@ class RankingDatabase:
                     
                     # 1. 学分变动幅度
                     if credit_diff < 5.0: score += 1000
-                    else: score += 0
                     
                     # 2. 整数偏好
                     is_integer = abs(credit_diff - round(credit_diff)) < 0.001
@@ -556,6 +575,12 @@ class RankingDatabase:
                     # 4. Rank Penalty
                     rank_dist = abs(new_s.rank - old_s.rank)
                     score -= rank_dist * 0.5
+                    
+                    # === 新增: 同学分一致性奖励 ===
+                    # 如果学分差等于众数，给予显著加分
+                    if target_credit_diff is not None:
+                        if abs(round(credit_diff) - target_credit_diff) < 0.5:
+                            score += 800  # 大幅奖励，鼓励选择与众数一致的匹配
 
                     candidates.append({
                         'score': score,
@@ -597,6 +622,14 @@ class RankingDatabase:
         # 检查是否有未匹配的新增条目 (视为变化)
         if matches_found_flag or len(used_new_indices) < len(new_students):
              has_changed = True
+        
+        # === 后处理: 尝试统一同时出分课程的学分 ===
+        if len(inferences) >= 2:
+            inferences = self._try_unify_credit_diffs(
+                inferences, old_students, new_students,
+                used_old_indices, used_new_indices,
+                semester, infer_pnp
+            )
              
         return inferences, has_changed
 
@@ -673,6 +706,115 @@ class RankingDatabase:
             self.save_inferences(inferences)
         
         return has_changed, latest_snapshot, inferences
+
+    def _try_unify_credit_diffs(
+        self, 
+        inferences: list[GradeInference], 
+        old_students: list[MajorStudentRanking], 
+        new_students: list[MajorStudentRanking],
+        used_old_indices: set,
+        used_new_indices: set,
+        semester: str,
+        infer_pnp: bool
+    ) -> list[GradeInference]:
+        """
+        后处理：尝试将同时出分的课程统一为相同学分
+        
+        逻辑：
+        1. 收集所有推断的学分差
+        2. 找到众数（出现最多的整数学分值）
+        3. 对于学分不等于众数的推断，尝试找替代匹配
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if len(inferences) < 2:
+            return inferences
+            
+        # 1. 收集所有推断的学分差（取整数）
+        credit_diffs = [inf.inferred_credits for inf in inferences]
+        rounded_diffs = [round(d) for d in credit_diffs]
+        
+        # 2. 计算众数
+        from collections import Counter
+        diff_counter = Counter(rounded_diffs)
+        most_common = diff_counter.most_common(1)
+        if not most_common:
+            return inferences
+            
+        target_credit, target_count = most_common[0]
+        
+        # 如果众数只出现一次或所有学分已一致，直接返回
+        if target_count < 2 or target_count == len(inferences):
+            return inferences
+            
+        logger.debug(f'同学分约束: 众数={target_credit}学分 (出现{target_count}次), 尝试统一...')
+        
+        # 3. 尝试调整不一致的推断
+        old_map = {i: s for i, s in enumerate(old_students)}
+        
+        # 记录当前匹配
+        current_matches = {}
+        for inf in inferences:
+            for n_idx, n_s in enumerate(new_students):
+                if n_s.rank == inf.rank and n_s.name == inf.name:
+                    for o_idx, o_s in old_map.items():
+                        if abs(o_s.gpa - inf.old_gpa) < 0.001 and abs(o_s.credits - inf.old_credits) < 0.001:
+                            current_matches[n_idx] = o_idx
+                            break
+                    break
+        
+        adjusted_inferences = []
+        adjustments_made = 0
+        
+        for inf in inferences:
+            rounded_credit = round(inf.inferred_credits)
+            
+            if rounded_credit == target_credit:
+                adjusted_inferences.append(inf)
+                continue
+                
+            # 找到对应的 new 学生
+            target_new_idx = None
+            for n_idx, n_s in enumerate(new_students):
+                if n_s.rank == inf.rank and n_s.name == inf.name:
+                    target_new_idx = n_idx
+                    break
+                    
+            if target_new_idx is None:
+                adjusted_inferences.append(inf)
+                continue
+                
+            new_s = new_students[target_new_idx]
+            best_alternative = None
+            
+            for o_idx, o_s in old_map.items():
+                if o_idx in used_old_indices and o_idx != current_matches.get(target_new_idx):
+                    continue
+                    
+                alt_credit_diff = new_s.credits - o_s.credits
+                
+                if abs(alt_credit_diff - target_credit) < 0.1:
+                    if self._is_mathematically_possible(o_s, new_s, alt_credit_diff, infer_pnp):
+                        best_alternative = (o_idx, o_s, alt_credit_diff)
+                        break
+            
+            if best_alternative:
+                o_idx, o_s, alt_credit_diff = best_alternative
+                new_inf = GradeInference.from_change(o_s, new_s, semester, infer_pnp=infer_pnp)
+                if new_inf:
+                    adjusted_inferences.append(new_inf)
+                    adjustments_made += 1
+                    logger.debug(f'  调整: {inf.name} 学分 {inf.inferred_credits:.1f} -> {new_inf.inferred_credits:.1f}')
+                else:
+                    adjusted_inferences.append(inf)
+            else:
+                adjusted_inferences.append(inf)
+        
+        if adjustments_made > 0:
+            logger.info(f'同学分约束: 调整了 {adjustments_made} 条推断，统一至 {target_credit} 学分')
+            
+        return adjusted_inferences
 
     def save_inferences(self, inferences: list[GradeInference]) -> None:
         """保存推断的成绩到数据库"""
