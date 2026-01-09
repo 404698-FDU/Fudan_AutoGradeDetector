@@ -523,7 +523,7 @@ class RankingDatabase:
             has_changed = n_new > 0
             return inferences, has_changed
         
-        # === 阶段1: 预扫描找到众数学分差 ===
+        # === 阶段1: 预扫描找到众数学分差（仅统计高质量匹配）===
         pre_scan_diffs = []
         for old_idx, old_s in enumerate(old_students):
             for new_idx, new_s in enumerate(new_students):
@@ -534,8 +534,9 @@ class RankingDatabase:
                     continue
                     
                 if 0.5 <= credit_diff <= 15:
-                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
-                    if is_valid:
+                    is_valid, quality = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    # 关键：只有高质量（标准等级）匹配才参与众数投票
+                    if is_valid and quality == "standard":
                         pre_scan_diffs.append(round(credit_diff))
         
         target_credit_diff = None
@@ -544,7 +545,7 @@ class RankingDatabase:
             most_common = diff_counter.most_common(1)
             if most_common and most_common[0][1] >= 2:
                 target_credit_diff = most_common[0][0]
-                logger.debug(f'同学分约束: 预扫描众数={target_credit_diff}学分 (出现{most_common[0][1]}次)')
+                logger.debug(f'同学分约束: 预扫描众数={target_credit_diff}学分 (出现{most_common[0][1]}次, 仅统计高质量匹配)')
         
         # === 阶段2: 构建代价矩阵 (加入同学分奖励) ===
         INF = 1e9
@@ -567,12 +568,19 @@ class RankingDatabase:
                 
                 # B. 推断匹配 (Inference)
                 if 0.5 <= credit_diff <= 15:
-                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    is_valid, quality = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
                     if not is_valid:
                         continue
                     
-                    cost = 100
+                    # 根据质量等级设置基础代价
+                    if quality == "standard":
+                        cost = 100  # 标准等级点位，优先选择
+                    elif quality == "fallback":
+                        cost = 2000  # 仅符合"接近原绩点"的兜底条件，大幅惩罚
+                    else:
+                        continue  # 不应该到这里
                     
+                    # 额外惩罚
                     if credit_diff >= 5.0:
                         cost += 2000
                     elif credit_diff >= 4.0:
@@ -585,13 +593,13 @@ class RankingDatabase:
                     cost += credit_diff * 10
                     cost += rank_dist * 0.1
                     
-                    # === 新增: 同学分一致性奖励 ===
-                    if target_credit_diff is not None:
+                    # === 同学分一致性奖励（仅对高质量匹配有效）===
+                    if target_credit_diff is not None and quality == "standard":
                         if abs(round(credit_diff) - target_credit_diff) < 0.5:
                             cost -= 800  # 代价减免，鼓励选择与众数一致的匹配
                     
                     cost_matrix[old_idx][new_idx] = cost
-                    match_info[(old_idx, new_idx)] = {'type': 'inference', 'diff': credit_diff}
+                    match_info[(old_idx, new_idx)] = {'type': 'inference', 'diff': credit_diff, 'quality': quality}
         
         # === 运行匈牙利算法 ===
         try:
@@ -657,7 +665,7 @@ class RankingDatabase:
         used_old_indices = set()
         used_new_indices = set()
         
-        # === 阶段1: 预扫描找到众数学分差 ===
+        # === 阶段1: 预扫描找到众数学分差（仅统计高质量匹配）===
         pre_scan_diffs = []
         for new_idx, new_s in enumerate(new_students):
             for old_idx, old_s in old_map.items():
@@ -667,8 +675,9 @@ class RankingDatabase:
                 if abs(credit_diff) < 0.001 and gpa_diff < 0.001:
                     continue
                 if 0.5 <= credit_diff <= 15:
-                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
-                    if is_valid:
+                    is_valid, quality = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    # 关键：只有高质量（标准等级）匹配才参与众数投票
+                    if is_valid and quality == "standard":
                         pre_scan_diffs.append(round(credit_diff))
         
         target_credit_diff = None
@@ -677,7 +686,7 @@ class RankingDatabase:
             most_common = diff_counter.most_common(1)
             if most_common and most_common[0][1] >= 2:
                 target_credit_diff = most_common[0][0]
-                logger.debug(f'同学分约束(回退): 预扫描众数={target_credit_diff}学分')
+                logger.debug(f'同学分约束(回退): 预扫描众数={target_credit_diff}学分 (仅统计高质量匹配)')
         
         # === 阶段2: 构建候选 (加入同学分奖励) ===
         candidates = []
@@ -705,10 +714,17 @@ class RankingDatabase:
                 
                 # Inference
                 if 0.5 <= credit_diff <= 15:
-                    is_valid = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
+                    is_valid, quality = self._is_mathematically_possible(old_s, new_s, credit_diff, infer_pnp)
                     if not is_valid: continue
                     
-                    score = 0
+                    # 根据质量等级设置基础得分
+                    if quality == "standard":
+                        score = 1000  # 标准等级点位，高分
+                    elif quality == "fallback":
+                        score = -1000  # 仅符合兜底条件，低分
+                    else:
+                        continue
+                    
                     if credit_diff < 5.0: score += 1000
                     
                     is_integer = abs(credit_diff - round(credit_diff)) < 0.001
@@ -719,8 +735,8 @@ class RankingDatabase:
                     rank_dist = abs(new_s.rank - old_s.rank)
                     score -= rank_dist * 0.5
                     
-                    # === 新增: 同学分一致性奖励 ===
-                    if target_credit_diff is not None:
+                    # === 同学分一致性奖励（仅对高质量匹配有效）===
+                    if target_credit_diff is not None and quality == "standard":
                         if abs(round(credit_diff) - target_credit_diff) < 0.5:
                             score += 800
 
@@ -729,7 +745,8 @@ class RankingDatabase:
                         'new_idx': new_idx,
                         'old_idx': old_idx,
                         'diff': credit_diff,
-                        'type': 'inference'
+                        'type': 'inference',
+                        'quality': quality
                     })
         
         candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -768,78 +785,72 @@ class RankingDatabase:
     def _is_mathematically_possible(self, old_s, new_s, credit_diff, infer_pnp):
         """
         判断推断出的绩点是否在数学上可能落入合法的复旦绩点区间
-        考虑到源数据的 GPA 是四舍五入到 2 位小数的
+        返回: (is_valid: bool, quality: str)
+            quality = "standard": 推断绩点符合标准等级点位
+            quality = "fallback": 仅满足推断值接近原累积绩点的兜底条件
+            quality = None: 完全不合法
         """
-        # 复旦合法绩点区间 (User Provided)
-        # 补充了一些缓冲以防边界定义过死
-        valid_intervals = [
-            (3.95, 4.05), # A: 4.0
-            (3.65, 3.85), # A-: 3.7-3.8
-            (3.25, 3.65), # B+: 3.3-3.6
-            (2.95, 3.25), # B: 3.0-3.2
-            (2.65, 2.95), # B-: 2.7-2.9
-            (2.25, 2.65), # C+: 2.3-2.6
-            (1.95, 2.25), # C: 2.0-2.2
-            (1.65, 1.95), # C-: 1.7-1.9
-            (1.25, 1.35), # D: 1.3
-            (0.95, 1.05), # D-: 1.0
-            (-0.05, 0.05) # F: 0
+        # 复旦官方绩点制度（用户提供）
+        # 格式: 单值表示精确点，元组表示范围
+        STANDARD_GRADES = [
+            4.0,                # A
+            (3.7, 3.8),        # A-
+            (3.3, 3.6),        # B+
+            (3.0, 3.2),        # B
+            (2.7, 2.9),        # B-
+            (2.3, 2.6),        # C+
+            (2.0, 2.2),        # C
+            (1.7, 1.9),        # C-
+            (1.3, 1.6),        # D
+            1.0,                # D-
+            0.0                 # F
         ]
         
-        # 对于大额学分变动 (Composite)，放宽检查，只要在大范围内即可
-        if credit_diff >= 4.5:
-             # 只要在 -0.1 ~ 4.05 之间就算可能 (复合课程均值可能落在任何地方)
-             # 但必须排除 > 4.05 的情况
-             # 计算 min/max inferred 看看是否完全超标
-             pass # 继续往下算 range
-             
-        # 计算 Old 和 New 的真实总分可能范围 (反向去四舍五入)
-        # GPA 3.00 -> [2.995, 3.005)
+        # 动态精度计算：基于舍入误差传播
+        # GPA 系统精度为 3 位小数，四舍五入误差为 ±0.0005
+        total_error = 0.0005 * (old_s.credits + new_s.credits)
+        precision_margin = (total_error / credit_diff) + 0.001  # 加安全缓冲
+        precision_margin = min(precision_margin, 0.02)  # 上限 0.02
+        
+        # 计算 Old 和 New 的真实总分可能范围（反四舍五入）
         old_gpa_min = old_s.gpa - 0.005
         old_gpa_max = old_s.gpa + 0.005
-        
         new_gpa_min = new_s.gpa - 0.005
         new_gpa_max = new_s.gpa + 0.005
         
-        # 推断出的学分绩点 X 的范围:
-        # X = (NewTotal - OldTotal) / Diff
-        # Min X occurs when New is smallest and Old is largest
+        # 推断绩点范围: X = (NewTotal - OldTotal) / CreditDiff
         inf_min = (new_gpa_min * new_s.credits - old_gpa_max * old_s.credits) / credit_diff
-        # Max X occurs when New is largest and Old is smallest
         inf_max = (new_gpa_max * new_s.credits - old_gpa_min * old_s.credits) / credit_diff
         
-        # 检查是否与任意合法区间有交集
-        has_overlap = False
+        # === 第一优先级：检查是否符合标准等级点位 ===
+        for grade in STANDARD_GRADES:
+            if isinstance(grade, tuple):
+                g_min, g_max = grade
+                # 检查推断区间是否与标准区间重叠（使用精度 margin）
+                if max(inf_min, g_min - precision_margin) < min(inf_max, g_max + precision_margin):
+                    return True, "standard"
+            else:
+                # 单值等级（如 A=4.0）
+                if max(inf_min, grade - precision_margin) < min(inf_max, grade + precision_margin):
+                    return True, "standard"
         
-        # 如果是大额更新，我们只检查总体界限，因为多门课平均分可以是任意值(如3.49)，会填补Gap
+        # === 第二优先级：大额学分变动的宽松检查 ===
+        # 多门课程的平均分可能落在任何位置（如3.49），故只检查总体界限
         if credit_diff >= 4.5:
-            # 大额更新允许落在 Gap 里 (如 3.49)，只要不超出 4.05 或低于 -0.1
-             if inf_max >= -0.1 and inf_min <= 4.05:
-                 return True
-             return False
+            if inf_max >= -0.1 and inf_min <= 4.05:
+                return True, "fallback"
         
-        # 小额更新，必须落在特定区间内
-        for (v_min, v_max) in valid_intervals:
-            # 检查区间 [inf_min, inf_max] 与 [v_min, v_max] 是否重叠
-            if max(inf_min, v_min) < min(inf_max, v_max):
-                has_overlap = True
-                break
+        # === 第三优先级：推断值接近原累积绩点 ===
+        # 说明新课程成绩恰好等于累计绩点（合理但低质量）
+        old_gpa = old_s.gpa
+        if max(inf_min, old_gpa - 0.15) < min(inf_max, old_gpa + 0.15):
+            return True, "fallback"
         
-        # === 新增：检查是否与原绩点相近 ===
-        # 如果推断绩点接近原累计绩点，说明新课程成绩恰好等于累计绩点
-        # 这是完全合理的情况
-        if not has_overlap:
-            old_gpa = old_s.gpa
-            if max(inf_min, old_gpa - 0.1) < min(inf_max, old_gpa + 0.1):
-                has_overlap = True
-                
-        # 特殊处理 PNP (如果开启)
-        if not has_overlap and infer_pnp:
-             # PNP 通常是 0 左右
-             if max(inf_min, -0.1) < min(inf_max, 0.1):
-                 has_overlap = True
-                 
-        return has_overlap
+        # === 特殊：P/NP 课程识别 ===
+        if infer_pnp and max(inf_min, -0.1) < min(inf_max, 0.1):
+            return True, "fallback"
+        
+        return False, None
 
     def _try_unify_credit_diffs(
         self, 
